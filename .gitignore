@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+# Data and recordings
+LRS3-TED/
+data/
+app_data/
+recordings/
+encrypted_cache/
+*.mp4
+*.wav
+*.flac
+*.npz
+*.enc
+
+# Models and experiment results
+runs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+logs/
+
+# Private keys
+*.key
+*.pem
+*.p12
+*.pfx
+id_ed25519*
+
+# Local files
+.DS_Store
+.ipynb_checkpoints/

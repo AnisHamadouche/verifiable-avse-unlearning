@@ -1,0 +1,19 @@
+name: Streamlit privacy demo CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -r requirements-app.txt
+      - run: python -m compileall -q app.py privacy_backend.py avse_unlearning.py secure_cache.py speech_metrics.py
+      - run: python -m pytest tests -q
