@@ -49,6 +49,18 @@ class CaptureBuffer:
                 self.lips.append((now,lip));self.found+=int(found)
         return frame
 
+    def sync_report(self):
+        with self.lock:
+            audio_count=sum(len(x) for x in self.audio)
+            frame_times=[float(t) for t,_ in self.lips]
+            start=self.audio_start
+            found=self.found
+        return {'audio_samples_captured':audio_count,
+                'video_frames_captured':len(frame_times),
+                'face_detected_fraction':round(found/max(len(frame_times),1),3),
+                'estimated_capture_span_s':round(max(frame_times)-min(frame_times),3) if len(frame_times)>1 else 0.,
+                'sync_method':'Approximate monotonic callbacks; not hardware timestamp synchronisation'}
+
     def export(self):
         with self.lock:
             if not self.audio or not self.lips:raise ValueError('Record with both mic and camera enabled')
@@ -80,7 +92,7 @@ st.sidebar.write('Data and keys remain on the machine running Streamlit. Use loc
 st.sidebar.caption('Storage: AES-GCM encrypted derived clips; private keys in separate directory; receipts are operator-issued.')
 
 PAGES = ['1 · Capture & import', '2 · Playback & preview', '3 · Train original / unlearn',
-         '4 · Records & deletion', '5 · Metrics', '6 · Certificates']
+         '4 · Records & deletion', '5 · Metrics', '6 · Certificates', '7 · Assurance & provenance', '8 · Automated privacy audit']
 if 'page_index' not in st.session_state:
     st.session_state.page_index = 0
 
@@ -123,8 +135,11 @@ if current_page == 0:
             submitted=st.form_submit_button('Save encrypted stream clip',disabled=bool(ctx.state.playing))
         if submitted:
             try:
+                quality=st.session_state.capture_buffer.sync_report()
                 clean,lips=st.session_state.capture_buffer.export()
                 row=lab.add(clean,lips,label,split,'webrtc')
+                lab.event('capture_quality',sample_id=row['id'],**quality)
+                st.json(quality)
                 st.success(f"Saved encrypted {row['id']} ({split}); sample key stored separately")
                 st.image(lips[0],caption='Extracted mouth region (approximate)',width=135)
                 st.session_state.capture_buffer=CaptureBuffer()
@@ -228,7 +243,9 @@ if current_page == 1:
             checkpoints = {'Original baseline': lab.root / 'original.pt',
                            'Retrained without withdrawn records': lab.root / 'retrained_without_deleted.pt',
                            'Fine-tuned model': lab.root / 'finetuned_without_deleted.pt'}
-            available_models = {k: v for k, v in checkpoints.items() if v.exists()}
+            revoked_present=any(r['status']=='revoked' for r in lab.records())
+            available_models = {k: v for k, v in checkpoints.items()
+                                if v.exists() and not (revoked_present and k=='Original baseline')}
             model_choice = st.selectbox('Enhancement model', list(available_models) if available_models else ['None trained'], key='preview_model')
             try:
                 clean, noisy, enhanced = make_preview_audio(lab, sid, available_models.get(model_choice), seed=42, snr=0.0)
@@ -288,10 +305,12 @@ if current_page == 2:
     st.write('Uses the same compact PyTorch audio-STFT + visual-CNN + GRU model as the LRS3 experiment. A fixed training/test split is constructed from encrypted clips.')
     epochs=st.number_input('Epochs',min_value=1,max_value=200,value=3)
     batch=st.number_input('Batch size',min_value=1,max_value=32,value=4)
+    architecture=st.selectbox('AVSE model', ['tiny','cross_attention'],
+                              help='Cross-attention is a research baseline; requires more memory and training.')
     if st.button('Train original AVSE baseline',type='primary'):
         try:
             with st.spinner('Training original model and evaluating test clips...'):
-                hist=lab.train_original(epochs,batch)
+                hist=lab.train_original(epochs,batch,architecture=architecture)
             st.success(f'Training completed: {len(hist)} epoch records')
         except Exception as e:st.error(str(e))
     st.divider()
@@ -408,6 +427,19 @@ if current_page == 4:
         st.caption('STOI/ESTOI = intelligibility estimates; PESQ-WB = quality; SI-SNRi/SNRi = enhancement. None establishes machine forgetting. PESQ is shown only if computed.')
     else:
         st.info('Run baseline training to produce metrics.')
+    st.divider()
+    st.subheader('Machine-unlearning audit (empirical proxy)')
+    privacy_path=lab.root/'unlearning_privacy_metrics.csv'
+    if privacy_path.exists():
+        pm=pd.read_csv(privacy_path)
+        st.dataframe(pm.round(4),use_container_width=True)
+        audit_columns=[c for c in ['membership_proxy_auc','retained_mean_l1','heldout_mean_l1','audit_seconds'] if c in pm.columns]
+        if audit_columns:
+            chosen_privacy=st.multiselect('Select privacy-audit measures',audit_columns,default=audit_columns)
+            if chosen_privacy:st.bar_chart(pm.set_index('model')[chosen_privacy])
+        st.download_button('Download privacy-audit CSV',privacy_path.read_bytes(),file_name='unlearning_privacy_metrics.csv')
+        st.warning('Membership AUC is a retained-vs-test loss-threshold proxy. Deleted-sample membership and certified forgetting are NOT measured.')
+    else:st.info('Run unlearning to calculate retained-vs-test membership proxy and audit latency.')
     hist=lab.root/'training_history.csv'
     if hist.exists():
         d=pd.read_csv(hist)
@@ -440,7 +472,99 @@ if current_page == 5:
         except Exception as exc:st.error(f'Invalid certificate signature: {exc}')
         st.download_button('Download certificate JSON',cert.read_bytes(),file_name='avse_audit_certificate.json',mime='application/json')
     st.divider()
-    st.caption('For independent verification: externally witnessed append-only logs, KMS/HSM attestations, explicit model deletion policies, and verifiable unlearning proofs are future research requirements.')
+    st.caption('For independent verification, download the certificate and verifier public key, pin the key outside the experiment, and check the hash-chain root against an externally retained checkpoint. This does NOT attest unknown copies or certified forgetting.')
+    pinned=lab.root/'verifier_public_key.hex'
+    if pinned.exists():
+        st.download_button('Download public key to pin externally',pinned.read_bytes(),file_name='avse_pinned_public_key.hex',mime='text/plain')
+    st.code('python verify_independent.py --certificate audit_certificate.json --pinned-public-key ~/trusted/avse_pinned_public_key.hex --chain event_chain.json',language='bash')
+
+if current_page == 6:
+    st.subheader('P1–P3: Registered lineage, withdrawal impact and verification')
+    st.caption('This is a registry of *known local* artifacts, not a proof of copy completeness.')
+    registry=lab.root/'lineage.json'
+    if registry.exists():
+        graph=json.loads(registry.read_text())
+        nodes=[{'artifact':k,'kind':v.get('kind'),'dependencies':len(v.get('sources',[])),
+                'hash':v.get('sha256')} for k,v in graph.get('nodes',{}).items()]
+        st.dataframe(pd.DataFrame(nodes),use_container_width=True)
+        st.download_button('Download lineage graph',registry.read_bytes(),file_name='lineage.json',mime='application/json')
+    impacted=lab.root/'withdrawal_impact.json'
+    if impacted.exists():
+        inventory=json.loads(impacted.read_text())
+        st.metric('Known dependent artifacts affected',len(inventory['affected_registered_artifacts']))
+        st.dataframe(pd.DataFrame([{'artifact':k,'kind':v.get('kind')} for k,v in inventory['affected_registered_artifacts'].items()]))
+        st.download_button('Download withdrawal impact report',impacted.read_bytes(),file_name='withdrawal_impact.json',mime='application/json')
+        st.warning('Affected model checkpoints must not be served. Remaining plaintext copies or third-party exports are not observable by this prototype.')
+    event_chain=lab.root/'event_chain.json'
+    if event_chain.exists():
+        from evidence import verify_chain
+        try:
+            current_root=verify_chain(json.loads(event_chain.read_text()))
+            st.success('Local hash-chain consistency verified')
+            st.code(current_root)
+            st.download_button('Export event chain',event_chain.read_bytes(),file_name='event_chain.json')
+            st.caption('Record the root OUTSIDE the operator machine before future events; otherwise truncation and rewriting can go undetected.')
+        except Exception as ex:st.error(f'Hash chain inconsistent: {ex}')
+    policy=lab.root/'model_serving_policy.json'
+    if policy.exists():st.json(json.loads(policy.read_text()))
+    st.info('Independent verification requires an externally pinned public key. A local hash chain alone is not an external witness.')
+
+
+if current_page == 7:
+    st.subheader('Automated healthcare privacy audit')
+    st.caption('Read-only audit of registered local records, revoked keys, ciphertext hashes, model-retirement state, provenance and certificate evidence. The result is NOT a regulatory certification.')
+    st.info('GitHub Actions runs this audit on synthetic records. Here you can audit the current local experiment without uploading recordings or key material.')
+    st.markdown('**Verification settings**')
+    require_cert = st.checkbox('Require certificate verification against an independently pinned key', value=False,
+                               help='Turn on only after exporting and pinning the trusted public key outside the application.')
+    pinned_path = st.text_input('Pinned public key file (verifier-controlled)', value='',
+                                disabled=not require_cert)
+    witnessed_root = st.text_input('Externally witnessed chain root (64-character SHA-256 hex)', value='',
+                                   disabled=not require_cert)
+    if st.button('Run privacy audit', type='primary'):
+        from scripts.privacy_audit import audit
+        import re
+        try:
+            if require_cert:
+                if not pinned_path.strip():
+                    raise ValueError('Specify a previously pinned verifier key file.')
+                if not re.fullmatch(r'[0-9a-fA-F]{64}', witnessed_root.strip()):
+                    raise ValueError('An independently witnessed 64-character chain root is required.')
+            result = audit(lab.root, lab.key_root, require_certificate=require_cert,
+                           pinned_key=Path(pinned_path).expanduser() if require_cert else None,
+                           witnessed_root=witnessed_root.strip().lower() if require_cert else None)
+            result_path = lab.root / 'privacy_audit_summary.json'
+            result_path.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
+            st.session_state['current_audit_report'] = result
+            if result.get('passed'):
+                st.success('All checks within the selected audit scope passed.')
+            else:
+                st.error('Privacy audit failed. Inspect failed checks before further training or release.')
+        except Exception as exc:
+            st.error(f'Audit could not complete: {exc}')
+    audit_result = st.session_state.get('current_audit_report')
+    saved_report = lab.root / 'privacy_audit_summary.json'
+    if saved_report.exists():
+        audit_result = json.loads(saved_report.read_text(encoding='utf-8'))
+    if audit_result:
+        checks = pd.DataFrame(audit_result.get('checks', []))
+        st.metric('Checks', len(checks))
+        if len(checks):
+            a, b = st.columns(2)
+            a.metric('Passed', int(checks['pass'].sum()))
+            b.metric('Failed', int((~checks['pass']).sum()))
+            st.dataframe(checks, use_container_width=True)
+        st.download_button('Download local privacy audit JSON',
+                           json.dumps(audit_result, indent=2).encode('utf-8'),
+                           file_name='privacy_audit_summary.json', mime='application/json')
+        with st.expander('Audit scope and limitations', expanded=True):
+            st.write(audit_result.get('scope', 'Local registered data only'))
+            for note in audit_result.get('limitations', []):
+                st.write('• ' + note)
+    st.divider()
+    st.markdown('**Run the same checks from the command line**')
+    st.code('python scripts/privacy_audit.py --root app_data/demo --key-root ~/.local/share/avse-streamlit-keys --output /tmp/avse-audit.json', language='bash')
+    st.caption('For independent checks, add --require-certificate --pinned-key PATH --witnessed-root HASH. Store the trust anchor and witnessed root outside the operator environment.')
 
 st.divider()
 footer_left, footer_center, footer_right = st.columns([1, 5, 1])

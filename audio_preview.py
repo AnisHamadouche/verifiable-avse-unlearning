@@ -3,7 +3,7 @@ Uses active (not withdrawn) training records as noise candidates.
 """
 import numpy as np
 import torch
-from avse_unlearning import TinyAVSE, SR, mix_babble, digest
+from avse_unlearning import make_model, infer_architecture, SR, mix_babble, digest
 
 
 def make_preview_audio(lab, sample_id, checkpoint=None, seed=42, snr=0.0):
@@ -19,7 +19,7 @@ def make_preview_audio(lab, sample_id, checkpoint=None, seed=42, snr=0.0):
     noisy = mix_babble(clean, pool, sample_id, local_seed, snr, lab.vault)
     if checkpoint is None:
         return clean, noisy, None
-    model = TinyAVSE(visual=True).cpu()
+    model = make_model(infer_architecture(checkpoint),visual=True).cpu()
     model.load_state_dict(torch.load(checkpoint, map_location='cpu', weights_only=True))
     model.eval()
     with torch.inference_mode():

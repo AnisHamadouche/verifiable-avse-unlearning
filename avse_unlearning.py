@@ -188,6 +188,48 @@ class TinyAVSE(nn.Module):
         return estimate
 
 
+
+class CrossAttentionAVSE(TinyAVSE):
+    """P4 research alternative: audio queries attend to video feature tokens.
+
+    This is a small trainable cross-attention baseline, not a validated SOTA model.
+    """
+    def __init__(self, visual=True):
+        super().__init__(visual=visual)
+        self.visual_projection=nn.Linear(32,128)
+        self.cross_attention=nn.MultiheadAttention(128,num_heads=4,batch_first=True)
+        self.cross_norm=nn.LayerNorm(128)
+
+    def forward(self,noisy,frames):
+        stft=torch.stft(noisy,FFT,HOP,window=self.window,return_complex=True)
+        mag=stft.abs().transpose(1,2)
+        audio=self.audio_net(torch.log1p(mag))
+        B,V,C,H,W=frames.shape
+        if self.visual:
+            visual=self.visual_net(frames.reshape(B*V,C,H,W)).reshape(B,V,-1)
+            kv=self.visual_projection(visual)
+            fusion,_=self.cross_attention(audio,kv,kv,need_weights=False)
+            audio=self.cross_norm(audio+fusion)
+            visual=F.interpolate(visual.transpose(1,2),size=audio.shape[1],
+                                 mode='linear',align_corners=False).transpose(1,2)
+        else:
+            visual=audio.new_zeros(B,audio.shape[1],32)
+        z,_=self.gru(torch.cat([audio,visual],-1))
+        mask=self.head(z).transpose(1,2)
+        return torch.istft(stft*mask,FFT,HOP,window=self.window,length=noisy.shape[-1])
+
+
+def make_model(architecture='tiny', visual=True):
+    if architecture=='tiny':return TinyAVSE(visual=visual)
+    if architecture=='cross_attention':return CrossAttentionAVSE(visual=visual)
+    raise ValueError(f'Unknown AVSE architecture: {architecture}')
+
+
+def infer_architecture(checkpoint):
+    """Detect from weights without changing older .pt state_dict format."""
+    state=torch.load(checkpoint,map_location='cpu',weights_only=True)
+    return 'cross_attention' if any(k.startswith('cross_attention.') for k in state) else 'tiny'
+
 def seed_all(seed):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -206,7 +248,7 @@ def sisnr(pred, ref):
 
 def train_model(train_rows, val_rows, pool, args, destination, vault, mode='from_scratch', source=None):
     seed_all(args.seed)
-    model = TinyAVSE(visual=not args.audio_only).to(args.device)
+    model = make_model(getattr(args,'architecture','tiny'), visual=not args.audio_only).to(args.device)
     if source:
         model.load_state_dict(torch.load(source, map_location='cpu', weights_only=True))
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -246,7 +288,7 @@ def train_model(train_rows, val_rows, pool, args, destination, vault, mode='from
 
 
 def evaluate(model_path, rows, pool, args, label, vault):
-    model = TinyAVSE(visual=not args.audio_only).to(args.device)
+    model = make_model(getattr(args,'architecture','tiny'), visual=not args.audio_only).to(args.device)
     model.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=True))
     model.eval()
     dataset = AVSEDataset(rows, pool, vault, args.seed + 5000, args.snr)

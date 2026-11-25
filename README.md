@@ -100,3 +100,72 @@ intelligibility (STOI/ESTOI), quality (PESQ-WB, if computed), enhancement
 **Select all available metrics** and **Clear metric selection** are provided.
 The selections filter the model summary, chart choices, individual-clip table,
 and downloadable CSV reports. Unavailable metrics are not offered.
+
+## P1–P5 research extensions (November 2026)
+
+The project now includes dependency lineage and deletion-impact reporting (P1); retraining/fine-tuning plus a **retained-vs-test** loss-membership proxy (P2); signed reports with independently pinnable Ed25519 verification keys and hash-chained events (P3); optional MediaPipe mouth landmarks and audio/visual cross-attention (P4); and extended synthetic GitHub CI with a source-only attested release (P5).
+
+The UI includes an additional **7 · Assurance & provenance** page. The original model is marked retired after withdrawal and cannot be selected for audio playback. Run `python -m pytest tests -q` to exercise synthetic integration tests. For scope, exact verification commands, limitations, and CI/CD, see [`docs/P1_P5_IMPLEMENTATION.md`](docs/P1_P5_IMPLEMENTATION.md).
+
+**Important:** These features do not turn the app into a production or clinical service. The local signing operator remains able to omit events; neither missing DEKs nor empirical membership proxy scores certify universal deletion or unlearning.
+
+
+## Automated privacy audit (P1–P5 + CI gate)
+
+The UI now has **8 · Automated privacy audit** as a separate Next/Back page. It displays
+pass/fail checks and exports `privacy_audit_summary.json` from the *local* experiment.
+The audit reads the experiment's registered records, encrypted sample keys and ciphertext,
+withdrawal receipts, model-serving policy, dependency lineage and event chain. It tests
+that active samples decrypt and revoked samples cannot be accessed through the active vault.
+
+From the repository root:
+
+```bash
+python -m pytest tests -q
+python scripts/generate_audit_fixture.py /tmp/avse-fixture /tmp/avse-keys
+python scripts/privacy_audit.py --root /tmp/avse-fixture --key-root /tmp/avse-keys \
+  --output /tmp/avse-privacy-audit.json
+```
+
+To audit a *real local research experiment* (never put it on public GitHub):
+
+```bash
+python scripts/privacy_audit.py --root app_data/demo \
+  --key-root "$HOME/.local/share/avse-streamlit-keys" \
+  --output /tmp/avse-local-audit.json
+```
+
+To verify the certificate independently, first pin its public key and a witnessed event
+chain root *outside the application operator's control*, then provide:
+
+```bash
+python scripts/privacy_audit.py --root app_data/demo \
+  --key-root "$HOME/.local/share/avse-streamlit-keys" \
+  --require-certificate --pinned-key "$HOME/trusted-avse/key.hex" \
+  --witnessed-root YOUR_PREVIOUSLY_WITNESSED_64_HEX_ROOT \
+  --output /tmp/avse-verified-audit.json
+```
+
+The GitHub Actions workflow `.github/workflows/privacy-audit.yml` runs only synthetic
+records for pull requests, `main`, weekly scheduled audits and manual runs. The
+source-release workflow now executes the same regression suite and synthetic deletion
+audit before creating an attested archive. Security checks fail the job on findings rather
+than ignoring them. Configure a **repository ruleset** requiring the `synthetic-privacy-audit`
+job and `privacy-ci` before merging into `main`.
+
+The prototype **does not** independently establish complete erasure of unknown copies,
+backups, clipboard/browser caches, or learned model information. Application certificates
+are not medical/regulatory compliance certificates; local event chains can be rewritten
+without an external witness. Keep clinical and volunteer data off GitHub.
+
+## Publication plots, tables and verification logs (CLI)
+
+To generate IEEE-style **title-free** PDF/EPS/PNG figures, CSV/LaTeX tables, a reporting log and SHA-256 manifest without opening Streamlit:
+
+```bash
+python -m pip install numpy pandas matplotlib
+python scripts/ieee_paper_report.py --run-dir app_data/demo \
+    --output paper_outputs/demo --bootstrap 2000 --dpi 600
+```
+
+For the earlier LRS3 command-line experiment, set `--run-dir runs/avse_experiment_01` instead. Full instructions, supported metrics and scientific limitations are in [`docs/IEEE_PAPER_REPORTING.md`](docs/IEEE_PAPER_REPORTING.md). The GitHub workflow `.github/workflows/report-smoke.yml` tests reporting on synthetic measurements without uploading volunteer data.

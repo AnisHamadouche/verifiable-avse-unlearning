@@ -18,6 +18,9 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 from secure_cache import EncryptedCache
+from lineage import register, report as withdrawal_report
+from evidence import write_chain, export_public_key
+from unlearning_audit import run_audit
 from avse_unlearning import (SR, NSAMPLES, NFRAMES, VWIDTH, TinyAVSE, train_model,
                              evaluate, seed_all)
 
@@ -66,6 +69,7 @@ class Lab:
         log = self.events()
         log.append(event)
         atomic_json(self.events_path, log)
+        write_chain(self.root, log)
         return event
 
     def add(self, clean, frames, label, split='train', source='recording'):
@@ -82,6 +86,7 @@ class Lab:
         row = {'id': sid, 'label': str(label)[:120], 'split': split,
                'source': source, 'status': 'active', 'created': timestamp()}
         all_rows = self.records(); all_rows.append(row); atomic_json(self.metadata, all_rows)
+        register(self.root,sid,'sample',[],sha256(self.vault._paths(sid)[0]),source=source,split=split)
         self.event('sample_added', sample_id=sid, split=split, ciphertext_sha256=sha256(self.vault._paths(sid)[0]))
         return row
 
@@ -106,7 +111,15 @@ class Lab:
         event=self.event('subset_key_revocation', sample_ids=sorted(selected),
                          receipt_count=len(receipts),
                          limitations='Local key absence only; original model checkpoint remains trained on withdrawn examples.')
-        out={'event':event,'receipts':receipts}
+        impact=withdrawal_report(self.root,selected)
+        # Serving the original trained model after withdrawal is disallowed.
+        # Its file remains as a research baseline, not a serving candidate.
+        atomic_json(self.root/'model_serving_policy.json',
+                    {'original.pt':'retired_after_withdrawal',
+                     'retrained_without_deleted.pt':'eligible_after_verified_training',
+                     'finetuned_without_deleted.pt':'experimental_not_certified',
+                     'updated_at':timestamp()})
+        out={'event':event,'receipts':receipts,'impact':impact}
         atomic_json(self.root / 'last_deletion_receipts.json', out)
         ledger=self.root / 'revocation_receipts.json'
         prior=json.loads(ledger.read_text()) if ledger.exists() else []
@@ -126,19 +139,23 @@ class Lab:
         if len(train)<3: raise ValueError('Need >=3 train clips to create babble')
         return train,val,tests
 
-    def train_original(self, epochs=3, batch_size=4, lr=0.001):
+    def train_original(self, epochs=3, batch_size=4, lr=0.001, architecture='tiny'):
         # A training dataset snapshot prevents selection of stale deleted samples.
         if any(r['status']=='revoked' for r in self.records()):
             raise ValueError('Original baseline must be trained before deleting samples. Retrain on retained samples instead.')
         train,val,tests=self._split()
         if (self.root/'original.pt').exists():
             raise ValueError('Original model already exists. Use a new experiment directory for a different baseline.')
+        self.architecture=architecture
         args=self._args(epochs,batch_size,lr)
         history=train_model(train,val,train+val,args,self.root/'original.pt',self.vault)
         atomic_json(self.root/'original_training_ids.json',
                     {'train_ids':[r['id'] for r in train], 'val_ids':[r['id'] for r in val], 'test_ids':[r['id'] for r in tests]})
         self._save_metrics('original', tests, train+val, args)
         self._append_history(history)
+        register(self.root,'original.pt','model', [r['id'] for r in train+val],sha256(self.root/'original.pt'),
+                 train_ids=[r['id'] for r in train],babble_pool_ids=[r['id'] for r in train+val])
+        register(self.root,'metrics_original.csv','report',['original.pt']+[r['id'] for r in tests])
         self.event('model_training', model='original', train_count=len(train), model_sha256=sha256(self.root/'original.pt'))
         return history
 
@@ -146,17 +163,23 @@ class Lab:
         return SimpleNamespace(seed=42,snr=0.,batch_size=int(batch_size),lr=float(lr),
                                epochs=int(epochs),finetune_epochs=int(epochs),
                                device='cuda' if torch.cuda.is_available() else 'cpu',
-                               audio_only=False,skip_intelligibility=False,pesq=False)
+                               audio_only=False,skip_intelligibility=False,pesq=False,
+                               architecture=getattr(self,'architecture','tiny'))
 
     def unlearn(self, epochs=3, batch_size=4, approximate=True):
         if not (self.root/'original.pt').exists(): raise ValueError('Train original model first')
         deleted=[r for r in self.records() if r['status']=='revoked']
         if not deleted: raise ValueError('Revoke at least one training sample first')
         train,val,tests=self._split()
+        from avse_unlearning import infer_architecture
+        self.architecture=infer_architecture(self.root/'original.pt')
         args=self._args(epochs,batch_size,0.001)
         hist=train_model(train,val,train+val,args,self.root/'retrained_without_deleted.pt',self.vault)
         self._save_metrics('retrained',tests,train+val,args)
         self._append_history(hist)
+        register(self.root,'retrained_without_deleted.pt','model',[r['id'] for r in train+val],
+                 sha256(self.root/'retrained_without_deleted.pt'),babble_pool_ids=[r['id'] for r in train+val])
+        register(self.root,'metrics_retrained.csv','report',['retrained_without_deleted.pt']+[r['id'] for r in tests])
         result={'retrained':sha256(self.root/'retrained_without_deleted.pt')}
         if approximate:
             hist2=train_model(train,val,train+val,args,self.root/'finetuned_without_deleted.pt',self.vault,
@@ -164,6 +187,13 @@ class Lab:
             self._save_metrics('finetuned',tests,train+val,args)
             self._append_history(hist2)
             result['finetuned']=sha256(self.root/'finetuned_without_deleted.pt')
+            register(self.root,'finetuned_without_deleted.pt','model',['original.pt']+[r['id'] for r in train+val],
+                     result['finetuned'],unlearning_claim='approximate fine-tune, no certified forgetting')
+            register(self.root,'metrics_finetuned.csv','report',['finetuned_without_deleted.pt']+[r['id'] for r in tests])
+        models={'original':self.root/'original.pt','retrained':self.root/'retrained_without_deleted.pt',
+                'finetuned':self.root/'finetuned_without_deleted.pt'}
+        result['privacy_audit']=run_audit(self.root,models,train+val,tests,self.vault,max_items=64)
+        result['lineage_impact']=withdrawal_report(self.root,[r['id'] for r in deleted])
         self.event('unlearning_experiment', withdrawn_ids=[r['id'] for r in deleted],
                    retained_training_ids=[r['id'] for r in train+val],
                    models_sha256=result,
@@ -206,7 +236,9 @@ class Lab:
         if not receipt_file.exists(): raise ValueError('Missing deletion evidence')
         proofs=json.loads(receipt_file.read_text())
         checked={r['sample_id']:r for r in proofs}
-        report={'schema':'AVSE-LOCAL-AUDIT-v1', 'issued_at':timestamp(),
+        self.event('audit_certificate_issuance_requested',revoked_count=len(revoked))
+        chain_root=write_chain(self.root,self.events())
+        report={'schema':'AVSE-LOCAL-AUDIT-v2','event_chain_root':chain_root, 'issued_at':timestamp(),
                 'scope':'local per-sample encrypted derived cache; model experiment',
                 'withdrawn_sample_ids':revoked,
                 'last_receipt_status':{i: bool(checked.get(i,{}).get('decrypt_blocked_by_missing_key',False)) for i in revoked},
@@ -217,10 +249,10 @@ class Lab:
                                'past plaintext leakage, or certified machine unlearning. Original checkpoint may retain influence.')}
         key=self.signer()
         pub=key.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw)
+        export_public_key(self.root,pub)
         envelope={'report':report,'public_key_ed25519_hex':pub.hex(),
                   'signature_ed25519_hex':key.sign(canonical(report)).hex()}
         atomic_json(self.root/'audit_certificate.json',envelope)
-        self.event('audit_certificate_issued',report_sha256=hashlib.sha256(canonical(report)).hexdigest())
         return envelope
 
 
@@ -232,6 +264,9 @@ def verify_certificate(envelope):
 
 def image_to_lips(bgr):
     """OpenCV Haar face detector, lower-face mouth-region proxy (not landmark-quality lips)."""
+    from visual_features import lip_landmark_crop
+    enhanced=lip_landmark_crop(bgr)
+    if enhanced is not None:return enhanced,True
     import cv2
     gray=cv2.cvtColor(bgr,cv2.COLOR_BGR2GRAY)
     cascade=cv2.CascadeClassifier(cv2.data.haarcascades+'haarcascade_frontalface_default.xml')
